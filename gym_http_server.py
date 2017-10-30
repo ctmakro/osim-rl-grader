@@ -13,17 +13,20 @@ from osim.env import RunEnv
 from gym.wrappers.time_limit import TimeLimit
 from gym import error
 
-from localsettings import CROWDAI_TOKEN, CROWDAI_URL, CROWDAI_CHALLENGE_ID
+from localsettings import CROWDAI_TOKEN, CROWDAI_URL, CROWDAI_CHALLENGE_CLIENT_NAME
 from localsettings import REDIS_HOST, REDIS_PORT
 from localsettings import DEBUG_MODE
 from localsettings import SEED_MAP
 from localsettings import CROWDAI_REPLAY_DATA_VERSION
+from localsettings import SUBMISSION_WINDOW_TTL, MAX_SUBMISSIONS_PER_WINDOW
+from localsettings import ENV_TTL, MAX_PARALLEL_ENVS
 
 from crowdai_worker import worker
 
 import redis
 from rq import Queue
 import json
+import time
 
 import logging
 logger = logging.getLogger('werkzeug')
@@ -39,9 +42,54 @@ def hSet(key, field, value):
     my_server = redis.Redis(connection_pool=POOL)
     my_server.hset(key, field, value)
 
+def hGet(key, field):
+    my_server = redis.Redis(connection_pool=POOL)
+    return my_server.hget(key, field)
+
 def rPush(key, value):
     my_server = redis.Redis(connection_pool=POOL)
     my_server.rpush(key, value)
+
+def generate_ttl_message(ttl):
+    m, s = divmod(ttl, 60)
+    h, m = divmod(m, 60)
+    _response = ""
+    if h > 0:
+        _response += "%d hours " % h
+    if m > 0:
+        _response += "%d minutes " % m
+    if s > 0:
+        _response += "%d seconds " % s
+    return _response
+
+def respectSubmissionLimit(_key):
+    r = redis.Redis(connection_pool=POOL)
+    submission_count = r.get(_key)
+    if submission_count == None:
+        submission_count = 0
+    else:
+        submission_count = int(submission_count)
+
+    ttl = r.ttl(_key)
+    if ttl == None:
+        ttl = SUBMISSION_WINDOW_TTL
+    TTL_MESSAGE = generate_ttl_message(ttl)
+
+    status = False
+    message = ""
+    if submission_count == 0:
+        r.set(_key, 1)
+        r.expire(_key, SUBMISSION_WINDOW_TTL)
+        status = True
+        message = "You have %d submissions left over the next %s " % (MAX_SUBMISSIONS_PER_WINDOW - 1, TTL_MESSAGE)
+    elif submission_count > 0 and submission_count < MAX_SUBMISSIONS_PER_WINDOW:
+        r.incr(_key)
+        status = True
+        message = "You have %d submissions left over the next %s " % (MAX_SUBMISSIONS_PER_WINDOW - 1, TTL_MESSAGE)
+    else:
+        status = False
+        message = "You have already made %d submissions in the last 24 hours. You can make your next submission in %s " % (MAX_SUBMISSIONS_PER_WINDOW, TTL_MESSAGE)
+    return (status, message)
 
 """
     Redis Connection Pool Helpers End
@@ -92,47 +140,80 @@ class Envs(object):
     def __init__(self):
         self.envs = {}
         self.id_len = 8
+        self.env_info = {}
 
     def _lookup_env(self, instance_id):
         try:
             return self.envs[instance_id]
         except KeyError:
-            raise InvalidUsage('Instance_id {} unknown'.format(instance_id))
+            raise InvalidUsage('Instance_id {} unknown or expired.'.format(instance_id))
 
     def _remove_env(self, instance_id):
         try:
             del self.envs[instance_id]
+            del self.env_info[instance_id]
         except KeyError:
-            raise InvalidUsage('Instance_id {} unknown'.format(instance_id))
+            raise InvalidUsage('Instance_id {} unknown or expired.'.format(instance_id))
 
-    def create(self, env_id, token):
-        try:
-            osim_envs = {'Run': RunEnv}
-            if env_id in osim_envs.keys():
-                # env = osim_envs[env_id](visualize=False)
-                # this part is changed to enable farming (increase capacity).
-                env = farmer.acq_env() # to change startup parameters, go to `farm.py`.
+    def _update_env_info(self, instance_id, key, value):
+        if instance_id not in self.env_info.keys():
+            self.env_info[instance_id] = {}
+
+        self.env_info[instance_id][key] = value
+
+    def _env_housekeeping(self, participant_id=False):
+        for instance_id in self.env_info.keys():
+            # Clean up all envs which have lives past their TTL
+            if time.time() - self.env_info[instance_id]['create_time'] > ENV_TTL:
+                self._remove_env(instance_id)
             else:
+                # If a user token is provided, clean up all envs belonging to the user token (participant_id)
+                if participant_id and self.env_info[instance_id]['user_token'] == participant_id:
+                    self._remove_env(instance_id)
+    def can_create_env(self, participant_id):
+        # Clean up expired Envs, and all (previous) envs belonging to the current user
+        self._env_housekeeping(participant_id)
+
+        if len(self.env_info.keys()) <= MAX_PARALLEL_ENVS:
+            return True
+        else:
+            return False
+
+    def create(self, env_id, participant_id):
+        if self.can_create_env(participant_id):
+            status, message = respectSubmissionLimit("CROWDAI::SUBMISSION_COUNT::%s" % participant_id)
+            if not status:
+                raise InvalidUsage(message)
+            try:
+                osim_envs = {'Run': RunEnv}
+                if env_id in osim_envs.keys():
+                    env = osim_envs[env_id](visualize=False)
+                else:
+                    raise InvalidUsage("Attempted to look up malformed environment ID '{}'".format(env_id))
+
+            except gym.error.Error:
                 raise InvalidUsage("Attempted to look up malformed environment ID '{}'".format(env_id))
 
-        except gym.error.Error:
-            raise InvalidUsage("Attempted to look up malformed environment ID '{}'".format(env_id))
+            instance_id = participant_id + "___" + str(uuid.uuid4().hex)[:10]
+            # TODO: that's an ugly way to control the program...
+            try:
+                self.env_close(instance_id)
+            except:
+                pass
+            self.envs[instance_id] = env
 
-        instance_id = token + "___" + str(uuid.uuid4().hex)[:10]
-        # TODO: that's an ugly way to control the program...
-        try:
-            self.env_close(instance_id)
-        except:
-            pass
-        self.envs[instance_id] = env
+            self._update_env_info(instance_id, "user_token", participant_id)
+            self._update_env_info(instance_id, "create_time", time.time())
 
-        # Start the relevant data-queues for actions, observations and rewards
-        # for the said instance id
-        rPush("CROWDAI::SUBMISSION::%s::actions"%(instance_id), "start")
-        rPush("CROWDAI::SUBMISSION::%s::observations"%(instance_id), "start")
-        rPush("CROWDAI::SUBMISSION::%s::rewards"%(instance_id), "start")
+            # Start the relevant data-queues for actions, observations and rewards
+            # for the said instance id
+            rPush("CROWDAI::SUBMISSION::%s::actions"%(instance_id), "start")
+            rPush("CROWDAI::SUBMISSION::%s::observations"%(instance_id), "start")
+            rPush("CROWDAI::SUBMISSION::%s::rewards"%(instance_id), "start")
 
-        return instance_id
+            return instance_id
+        else:
+            raise InvalidUsage("We are running at full capacity at the moment. Please try again in a few minutes.")
 
     def list_all(self):
         return dict([(instance_id, env.spec.id) for (instance_id, env) in self.envs.items()])
@@ -163,7 +244,7 @@ class Envs(object):
             nice_action = np.array(action)
         if render:
             env.render()
-         
+
         serialized_action = repr(nice_action.tolist())
         rPush("CROWDAI::SUBMISSION::%s::actions"%(instance_id), serialized_action)
         deserialized_action = np.array(eval(serialized_action))
@@ -250,20 +331,27 @@ class Envs(object):
         print("Submitting to crowdAI.org as Stanford...")
 
         if not DEBUG_MODE:
-            headers = {'Authorization': 'Token token="%s"' % CROWDAI_TOKEN}
-            r = requests.post(CROWDAI_URL + "?api_key=%s&challenge_id=%d&score=%f&grading_status=graded" % (instance_id.split("___")[0], CROWDAI_CHALLENGE_ID, SCORE), headers=headers)
-            if r.status_code != 202:
-                return None
+            api_key = hGet("CROWDAI::API_KEY_MAP", instance_id.split("___")[0] )
+            headers = {
+                'Accept': 'application/vnd.api+json',
+                'Content-Type': 'application/vnd.api+json',
+                'Authorization': 'Token token={}'.format(CROWDAI_TOKEN)
+            }
+            params = {
+                'challenge_client_name': CROWDAI_CHALLENGE_CLIENT_NAME,
+                'api_key' : api_key,
+                'grading_status': 'graded',
+                'score': SCORE
+            }
+            r = requests.post(CROWDAI_URL, headers=headers, params=params)
+            if r.status_code == 202:
+                crowdai_submission_id = json.loads(r.text)["submission_id"]
+                rPush("CROWDAI::SUBMITTED_Q", instance_id)
+                hSet("CROWDAI::INSTANCE_ID_MAP", instance_id, crowdai_submission_id)
+                Q.enqueue(worker, instance_id, timeout=3600)
             else:
-		print r.text
-		crowdai_submission_id = json.loads(r.text)["submission_id"]
-        rPush("CROWDAI::SUBMITTED_Q", instance_id)
-
-
-        if not DEBUG_MODE:
-	    hSet("CROWDAI::INSTANCE_ID_MAP", instance_id, crowdai_submission_id)
-            Q.enqueue(worker, instance_id, timeout=3600)
-        ## TO-DO :: Store instance_id -> submission_id mapping in a hash
+                # Keep a track of the error response
+                print r.text
 
         return SCORE
 
@@ -274,6 +362,7 @@ class Envs(object):
 
 ########## App setup ##########
 app = Flask(__name__)
+app.debug = True
 envs = Envs()
 
 ########## Error handling ##########
@@ -328,6 +417,12 @@ def patch_send():
 
 #patch_send()
 
+def create_env_after_validation(envs, env_id, participant_id):
+    instance_id = envs.create(env_id, participant_id)
+    response = jsonify(instance_id=instance_id)
+    response.status_code = 200
+    return response
+
 ########## API route definitions ##########
 @app.route('/v1/envs/', methods=['POST'])
 def env_create():
@@ -343,27 +438,32 @@ def env_create():
         manipulated
     """
     env_id = get_required_param(request.get_json(), 'env_id')
-    token = get_required_param(request.get_json(), 'token')
+    api_key = get_required_param(request.get_json(), 'token').strip()
     version = get_required_param(request.get_json(), 'version')
 
-    instance_id = envs.create(env_id, token)
-
+    # Validate client version
     if version != pkg_resources.get_distribution("osim-rl").version:
         response = jsonify(message = "Wrong version. Please update to the new version. Read more on https://github.com/stanfordnmbl/osim-rl/docs")
         response.status_code = 400
         return response
 
-    if DEBUG_MODE:
-        response = jsonify(instance_id=instance_id)
-        response.status_code = 200
+    # Validate API Key
+    headers = {
+        'Accept': 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json',
+        'Authorization': 'Token token={}'.format(CROWDAI_TOKEN)}
+    r = requests.get(CROWDAI_URL + api_key, headers=headers)
+
+    if r.status_code == 200:
+        payload = json.loads(r.text)
+        participant_id = str(payload['participant_id'])
+        hSet("CROWDAI::API_KEY_MAP", participant_id, api_key)
+        response = create_env_after_validation(envs, env_id, participant_id)
         return response
-
-    headers = {'Authorization': 'Token token="%s"' % CROWDAI_TOKEN}
-    r = requests.get(CROWDAI_URL + token, headers=headers)
-    response = jsonify(instance_id = instance_id)
-    response.status_code = r.status_code
-
-    return response
+    else:
+        response = jsonify(message = "Unable to authenticate API Key.")
+        response.status_code = 400
+        return response
 
 #@app.route('/v1/envs/', methods=['GET'])
 def env_list_all():
@@ -570,7 +670,7 @@ def shutdown():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Start a Gym HTTP API server')
-    parser.add_argument('-l', '--listen', help='interface to listen to', default='127.0.0.1')
+    parser.add_argument('-l', '--listen', help='interface to listen to', default='0.0.0.0')
     parser.add_argument('-p', '--port', default=5000, type=int, help='port to bind to')
 
     args = parser.parse_args()

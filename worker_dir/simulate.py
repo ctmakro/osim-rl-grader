@@ -67,7 +67,6 @@ the last index will be "close"
 
 the simulation should stop at the 2nd index
 """
-trial_count = 0
 
 OBSERVATIONS = []
 REWARDS = []
@@ -75,12 +74,13 @@ REWARDS = []
 for idx, trial in enumerate(ACTIONS):
 	if idx >= len(SEED_MAP):
 		break
-        observation = env.reset(difficulty=2, seed=SEED_MAP[trial_count])
+        observation = env.reset(difficulty=2, seed=SEED_MAP[idx-1])
 	OBSERVATIONS.append("reset")
 	REWARDS.append("reset")
 	OBSERVATIONS.append(observation)
 	for _action in trial:
 		observation, reward, done, info = env.step(_action)
+		print observation
 		OBSERVATIONS.append(observation)
 		REWARDS.append(reward)
 		if done:
@@ -141,10 +141,15 @@ if RENDER_LOGO:
 
 
 print "Submitting media to CrowdAI...."
-#TODO: Make these configurable and deal with the changes in the API 
-headers = {'Authorization' : 'Token token='+CROWDAI_TOKEN, "Content-Type":"application/vnd.api+json"}
-crowdai_internal_submission_id = r.hget("CROWDAI::INSTANCE_ID_MAP", SUBMISSION_ID)
+#TODO: Make these configurable and deal with the changes in the API
+headers = {
+    'Accept': 'application/vnd.api+json',
+    'Content-Type': 'application/vnd.api+json',
+    'Authorization': 'Token token={}'.format(CROWDAI_TOKEN)
+}
 
+crowdai_internal_submission_id = r.hget("CROWDAI::INSTANCE_ID_MAP", SUBMISSION_ID)
+# TODO: Make CROWDAI_URL configurable
 CROWDAI_URL = "https://www.crowdai.org/api/external_graders/"+str(crowdai_internal_submission_id)
 
 _payload = {
