@@ -109,7 +109,9 @@ class Envs(object):
         try:
             osim_envs = {'Run': RunEnv}
             if env_id in osim_envs.keys():
-                env = osim_envs[env_id](visualize=False)
+                # env = osim_envs[env_id](visualize=False)
+                # this part is changed to enable farming (increase capacity).
+                env = farmer.acq_env() # to change startup parameters, go to `farm.py`.
             else:
                 raise InvalidUsage("Attempted to look up malformed environment ID '{}'".format(env_id))
 
@@ -137,7 +139,12 @@ class Envs(object):
 
     def reset(self, instance_id):
         env = self._lookup_env(instance_id)
-        obs = env._reset(difficulty=2, seed=SEED_MAP[env.trial-1])
+        # obs = env._reset(difficulty=2, seed=SEED_MAP[env.trial-1])
+        # CRITICAL: the farming code did not support seeding remotely. `farm.py` will be modified for this purpose.
+        # PLEASE check if the seeds are correct before put into production.
+        # PLEASE make sure that SEED_MAP[x] is pickleable.
+        obs = env.reset(seed=SEED_MAP[env.trial-1])
+
         env.trial += 1
         if env.trial == len(SEED_MAP)+1:
             obs = None
@@ -161,7 +168,10 @@ class Envs(object):
         rPush("CROWDAI::SUBMISSION::%s::actions"%(instance_id), serialized_action)
         deserialized_action = np.array(eval(serialized_action))
 
-        [observation, reward, done, info] = env.step(deserialized_action)
+        # [observation, reward, done, info] = env.step(deserialized_action)
+        # the farming envs does not support numpy ndarrays.
+        [observation, reward, done, info]=env.step([i for i in deserialized_action])
+
         obs_jsonable = env.observation_space.to_jsonable(observation)
 
         rPush("CROWDAI::SUBMISSION::%s::observations"%(instance_id), repr(obs_jsonable))

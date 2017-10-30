@@ -52,8 +52,8 @@ class remoteEnv:
         self.fp = fp
         self.id = id
 
-    def reset(self):
-        return self.fp.reset(self.id)
+    def reset(self,seed=None):
+        return self.fp.reset(self.id,seed=seed)
 
     def step(self,actions):
         ret = self.fp.step(self.id, actions)

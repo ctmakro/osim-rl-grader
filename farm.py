@@ -53,7 +53,8 @@ def standalone_headless_isolated(pq, cq, plock):
             #     raise Exception('pipe message received by headless is not a tuple')
 
             if msg[0] == 'reset':
-                o = e.reset(difficulty=2)
+                seed = None if len(msg)==1 else msg[1]
+                o = e.reset(difficulty=2,seed=seed)
                 # conn.send(floatify(o))
                 cq.put(floatify(o))
                 # conn.put(floatify(o))
@@ -183,7 +184,7 @@ class ei: # Environment Instance
             raise Exception(e)
         return r
 
-    def reset(self):
+    def reset(self,seed=None):
         self.timer_update()
         if not self.is_alive():
             # if our process is dead for some reason
@@ -198,7 +199,7 @@ class ei: # Environment Instance
             self.newproc()
 
         self.reset_count += 1
-        self.send(('reset',))
+        self.send(('reset',seed))
         r = self.recv()
         self.timer_update()
         return r
@@ -331,14 +332,14 @@ class farm:
             traceback.print_exc()
             raise e
 
-    def reset(self,id):
+    def reset(self,id,seed=None):
         e = self.eip.get_env_by_id(id)
         if e == False:
             self.pretty(str(id)+' not found on reset(), might already be released')
             return False
 
         try:
-            oo = e.reset()
+            oo = e.reset(seed=seed)
             return oo
         except Exception as e:
             traceback.print_exc()
