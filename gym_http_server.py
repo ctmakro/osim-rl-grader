@@ -33,6 +33,16 @@ logger = logging.getLogger('werkzeug')
 logger.setLevel(logging.ERROR)
 
 """
+farming code added by Qin Yongliang
+"""
+from farmer import farmer as farmer_class
+import numpy as np
+import time
+
+# singleton
+farmer = farmer_class()
+
+"""
     Redis Conneciton Pool Helpers
 """
 POOL = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, db=1)
@@ -187,7 +197,15 @@ class Envs(object):
             try:
                 osim_envs = {'Run': RunEnv}
                 if env_id in osim_envs.keys():
-                    env = osim_envs[env_id](visualize=False)
+                    # env = osim_envs[env_id](visualize=False)
+
+                    # acquire a proxy of RunEnv from farms
+                    remote_env = farmer.acq_env()
+                    if remote_env == False: # no free environment
+                        raise InvalidUsage('No free environments available in the farms at the moment.')
+                    else:
+                        # assign if available
+                        env = remote_env
                 else:
                     raise InvalidUsage("Attempted to look up malformed environment ID '{}'".format(env_id))
 
@@ -357,7 +375,8 @@ class Envs(object):
 
     def env_close(self, instance_id):
         env = self._lookup_env(instance_id)
-        env.close()
+        # env.close()
+        env.rel() # you don't have to close a remote env, just release.
         self._remove_env(instance_id)
 
 ########## App setup ##########
